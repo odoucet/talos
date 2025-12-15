@@ -452,6 +452,15 @@ func (ctrl *LinkConfigController) processLinkConfigs(logger *zap.Logger, linkMap
 		case talosconfig.NetworkVLANConfig:
 			parentLink := linkNameResolver.Resolve(specificLinkConfig.ParentLink())
 			vlanLink(linkMap[linkName], linkName, parentLink, networkVLANConfigToVlaner{specificLinkConfig})
+
+			// ensure parent link is brought up when VLAN is configured on it
+			if _, exists := linkMap[parentLink]; !exists {
+				linkMap[parentLink] = &network.LinkSpecSpec{
+					Name:        parentLink,
+					Up:          true,
+					ConfigLayer: network.ConfigMachineConfiguration,
+				}
+			}
 		case talosconfig.NetworkBondConfig:
 			SendBondMaster(linkMap[linkName], specificLinkConfig)
 
