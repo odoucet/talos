@@ -814,6 +814,47 @@ func (suite *LinkConfigSuite) TestMulticast() {
 	)
 }
 
+func (suite *LinkConfigSuite) TestVLANWithoutParentConfig() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.LinkConfigController{}))
+
+	// Create a VLAN on eth10 without explicitly configuring eth10 itself
+	// The parent eth10 should still be brought up automatically
+	vl1 := networkcfg.NewVLANConfigV1Alpha1("eth10.100")
+	vl1.VLANIDConfig = 100
+	vl1.ParentLinkConfig = "eth10"
+	vl1.LinkMTU = 1500
+
+	ctr, err := container.New(vl1)
+	suite.Require().NoError(err)
+
+	cfg := config.NewMachineConfig(ctr)
+	suite.Create(cfg)
+
+	suite.assertLinks(
+		[]string{
+			"configuration/eth10",
+			"configuration/eth10.100",
+		}, func(r *network.LinkSpec, asrt *assert.Assertions) {
+			asrt.Equal(network.ConfigMachineConfiguration, r.TypedSpec().ConfigLayer)
+
+			switch r.TypedSpec().Name {
+			case "eth10":
+				// Parent eth10 should be brought up even without explicit configuration
+				// This is required so the VLAN can be created on it
+				asrt.True(r.TypedSpec().Up)
+				asrt.False(r.TypedSpec().Logical)
+			case "eth10.100":
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal("vlan", r.TypedSpec().Kind)
+				asrt.Equal("eth10", r.TypedSpec().ParentName)
+				asrt.EqualValues(100, r.TypedSpec().VLAN.VID)
+				asrt.EqualValues(1500, r.TypedSpec().MTU)
+			}
+		},
+	)
+}
+
 func TestLinkConfigSuite(t *testing.T) {
 	t.Parallel()
 
