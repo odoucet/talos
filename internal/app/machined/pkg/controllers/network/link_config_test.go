@@ -855,6 +855,88 @@ func (suite *LinkConfigSuite) TestVLANWithoutParentConfig() {
 	)
 }
 
+func (suite *LinkConfigSuite) TestOldStyleBondWithVLANsNoParentIP() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.LinkConfigController{}))
+
+	u, err := url.Parse("https://foo:6443")
+	suite.Require().NoError(err)
+
+	// Test old-style v1alpha1 configuration with bond + VLANs but NO IP on bond parent
+	// This verifies that the old-style configuration correctly creates bond with Up=true
+	cfg := config.NewMachineConfig(
+		container.NewV1Alpha1(
+			&v1alpha1.Config{
+				ConfigVersion: "v1alpha1",
+				MachineConfig: &v1alpha1.MachineConfig{
+					MachineNetwork: &v1alpha1.NetworkConfig{
+						NetworkInterfaces: []*v1alpha1.Device{
+							{
+								DeviceInterface: "bond0",
+								DeviceBond: &v1alpha1.Bond{
+									BondInterfaces: []string{"eth10", "eth11"},
+									BondMode:       "802.3ad",
+								},
+								// NO DeviceAddresses on bond0 itself - only on VLANs
+								DeviceVlans: []*v1alpha1.Vlan{
+									{
+										VlanID: 100,
+										VlanAddresses: []string{
+											"10.0.1.1/24",
+										},
+									},
+									{
+										VlanID: 200,
+										VlanAddresses: []string{
+											"10.0.2.1/24",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				ClusterConfig: &v1alpha1.ClusterConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{
+						Endpoint: &v1alpha1.Endpoint{
+							URL: u,
+						},
+					},
+				},
+			},
+		),
+	)
+
+	suite.Create(cfg)
+
+	suite.assertLinks(
+		[]string{
+			"configuration/bond0",
+			"configuration/bond0.100",
+			"configuration/bond0.200",
+			"configuration/eth10",
+			"configuration/eth11",
+		}, func(r *network.LinkSpec, asrt *assert.Assertions) {
+			asrt.Equal(network.ConfigMachineConfiguration, r.TypedSpec().ConfigLayer)
+
+			switch r.TypedSpec().Name {
+			case "bond0":
+				// Bond should be brought up even without addresses on parent
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal("bond", r.TypedSpec().Kind)
+			case "bond0.100", "bond0.200":
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal("vlan", r.TypedSpec().Kind)
+				asrt.Equal("bond0", r.TypedSpec().ParentName)
+			case "eth10", "eth11":
+				asrt.True(r.TypedSpec().Up)
+				asrt.Equal("bond0", r.TypedSpec().BondSlave.MasterName)
+			}
+		},
+	)
+}
+
 func TestLinkConfigSuite(t *testing.T) {
 	t.Parallel()
 
