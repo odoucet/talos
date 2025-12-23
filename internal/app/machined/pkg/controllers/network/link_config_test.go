@@ -814,6 +814,241 @@ func (suite *LinkConfigSuite) TestMulticast() {
 	)
 }
 
+func (suite *LinkConfigSuite) TestVLANWithoutParentConfig() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.LinkConfigController{}))
+
+	// Create a VLAN on eth10 without explicitly configuring eth10 itself
+	// The parent eth10 should still be brought up automatically
+	vl1 := networkcfg.NewVLANConfigV1Alpha1("eth10.100")
+	vl1.VLANIDConfig = 100
+	vl1.ParentLinkConfig = "eth10"
+	vl1.LinkMTU = 1500
+
+	ctr, err := container.New(vl1)
+	suite.Require().NoError(err)
+
+	cfg := config.NewMachineConfig(ctr)
+	suite.Create(cfg)
+
+	suite.assertLinks(
+		[]string{
+			"configuration/eth10",
+			"configuration/eth10.100",
+		}, func(r *network.LinkSpec, asrt *assert.Assertions) {
+			asrt.Equal(network.ConfigMachineConfiguration, r.TypedSpec().ConfigLayer)
+
+			switch r.TypedSpec().Name {
+			case "eth10":
+				// Parent eth10 should be brought up even without explicit configuration
+				// This is required so the VLAN can be created on it
+				asrt.True(r.TypedSpec().Up)
+				asrt.False(r.TypedSpec().Logical)
+			case "eth10.100":
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal("vlan", r.TypedSpec().Kind)
+				asrt.Equal("eth10", r.TypedSpec().ParentName)
+				asrt.EqualValues(100, r.TypedSpec().VLAN.VID)
+				asrt.EqualValues(1500, r.TypedSpec().MTU)
+			}
+		},
+	)
+}
+
+func (suite *LinkConfigSuite) TestOldStyleBondWithVLANsNoParentIP() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.LinkConfigController{}))
+
+	u, err := url.Parse("https://foo:6443")
+	suite.Require().NoError(err)
+
+	// Test old-style v1alpha1 configuration with bond + VLANs but NO IP on bond parent
+	// This verifies that the old-style configuration correctly creates bond with Up=true
+	cfg := config.NewMachineConfig(
+		container.NewV1Alpha1(
+			&v1alpha1.Config{
+				ConfigVersion: "v1alpha1",
+				MachineConfig: &v1alpha1.MachineConfig{
+					MachineNetwork: &v1alpha1.NetworkConfig{
+						NetworkInterfaces: []*v1alpha1.Device{
+							{
+								DeviceInterface: "bond0",
+								DeviceBond: &v1alpha1.Bond{
+									BondInterfaces: []string{"eth10", "eth11"},
+									BondMode:       "802.3ad",
+								},
+								// NO DeviceAddresses on bond0 itself - only on VLANs
+								DeviceVlans: []*v1alpha1.Vlan{
+									{
+										VlanID: 100,
+										VlanAddresses: []string{
+											"10.0.1.1/24",
+										},
+									},
+									{
+										VlanID: 200,
+										VlanAddresses: []string{
+											"10.0.2.1/24",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				ClusterConfig: &v1alpha1.ClusterConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{
+						Endpoint: &v1alpha1.Endpoint{
+							URL: u,
+						},
+					},
+				},
+			},
+		),
+	)
+
+	suite.Create(cfg)
+
+	suite.assertLinks(
+		[]string{
+			"configuration/bond0",
+			"configuration/bond0.100",
+			"configuration/bond0.200",
+			"configuration/eth10",
+			"configuration/eth11",
+		}, func(r *network.LinkSpec, asrt *assert.Assertions) {
+			asrt.Equal(network.ConfigMachineConfiguration, r.TypedSpec().ConfigLayer)
+
+			switch r.TypedSpec().Name {
+			case "bond0":
+				// Bond should be brought up even without addresses on parent
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal("bond", r.TypedSpec().Kind)
+			case "bond0.100", "bond0.200":
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal("vlan", r.TypedSpec().Kind)
+				asrt.Equal("bond0", r.TypedSpec().ParentName)
+			case "eth10", "eth11":
+				asrt.True(r.TypedSpec().Up)
+				asrt.Equal("bond0", r.TypedSpec().BondSlave.MasterName)
+			}
+		},
+	)
+}
+
+func (suite *LinkConfigSuite) TestBondWithVLANsExactUserConfig() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.LinkConfigController{}))
+
+	u, err := url.Parse("https://foo:6443")
+	suite.Require().NoError(err)
+
+	// Test exact configuration from user's comment (https://github.com/odoucet/talos/pull/1#issuecomment-3656952899)
+	// Bond with xmitHashPolicy, lacpRate, and VLANs with routes - NO IP on bond0 parent
+	cfg := config.NewMachineConfig(
+		container.NewV1Alpha1(
+			&v1alpha1.Config{
+				ConfigVersion: "v1alpha1",
+				MachineConfig: &v1alpha1.MachineConfig{
+					MachineNetwork: &v1alpha1.NetworkConfig{
+						NetworkHostname: "turnlb01.dc4.oxv.fr",
+						NetworkInterfaces: []*v1alpha1.Device{
+							{
+								DeviceInterface: "bond0",
+								// NO DeviceAddresses - this is the key part of the test
+								DeviceBond: &v1alpha1.Bond{
+									BondInterfaces:     []string{"enp6s0f0", "enp6s0f1"},
+									BondMode:           "802.3ad",
+									BondHashPolicy:     "layer3+4",
+									BondLACPRate:       "fast",
+								},
+								DeviceVlans: []*v1alpha1.Vlan{
+									{
+										VlanID: 2,
+										VlanAddresses: []string{
+											"10.0.0.1/29", // Using placeholder IP
+										},
+										VlanRoutes: []*v1alpha1.Route{
+											{
+												RouteNetwork: "0.0.0.0/0",
+												RouteGateway: "10.0.0.254",
+											},
+										},
+									},
+									{
+										VlanID: 200,
+										VlanAddresses: []string{
+											"192.168.1.1/24", // Using placeholder IP
+										},
+										VlanRoutes: []*v1alpha1.Route{
+											{
+												RouteNetwork: "10.0.0.0/16",
+												RouteGateway: "192.168.1.254",
+											},
+											{
+												RouteNetwork: "192.168.0.0/16",
+												RouteGateway: "192.168.1.254",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				ClusterConfig: &v1alpha1.ClusterConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{
+						Endpoint: &v1alpha1.Endpoint{
+							URL: u,
+						},
+					},
+				},
+			},
+		),
+	)
+
+	suite.Create(cfg)
+
+	suite.assertLinks(
+		[]string{
+			"configuration/bond0",
+			"configuration/bond0.2",
+			"configuration/bond0.200",
+			"configuration/enp6s0f0",
+			"configuration/enp6s0f1",
+		}, func(r *network.LinkSpec, asrt *assert.Assertions) {
+			asrt.Equal(network.ConfigMachineConfiguration, r.TypedSpec().ConfigLayer)
+
+			switch r.TypedSpec().Name {
+			case "bond0":
+				// CRITICAL: Bond must be Up=true even without IP addresses
+				asrt.True(r.TypedSpec().Up, "bond0 must be Up even without IP addresses")
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal("bond", r.TypedSpec().Kind)
+				// Verify bond settings
+				asrt.Equal(nethelpers.BondMode8023AD, r.TypedSpec().BondMaster.Mode)
+				asrt.Equal(nethelpers.BondXmitPolicyLayer34, r.TypedSpec().BondMaster.HashPolicy)
+				asrt.Equal(nethelpers.LACPRateFast, r.TypedSpec().BondMaster.LACPRate)
+			case "bond0.2":
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal("vlan", r.TypedSpec().Kind)
+				asrt.Equal("bond0", r.TypedSpec().ParentName)
+				asrt.EqualValues(2, r.TypedSpec().VLAN.VID)
+			case "bond0.200":
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal("vlan", r.TypedSpec().Kind)
+				asrt.Equal("bond0", r.TypedSpec().ParentName)
+				asrt.EqualValues(200, r.TypedSpec().VLAN.VID)
+			case "enp6s0f0", "enp6s0f1":
+				asrt.True(r.TypedSpec().Up)
+				asrt.Equal("bond0", r.TypedSpec().BondSlave.MasterName)
+			}
+		},
+	)
+}
+
 func TestLinkConfigSuite(t *testing.T) {
 	t.Parallel()
 
